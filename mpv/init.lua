@@ -1,0 +1,687 @@
+local M = {}
+local promise = require 'promise'
+
+local cfg = {
+  socket = '/tmp/lazycmd-mpv.sock',
+  mpv_args = {
+    '--idle=yes',
+    '--no-video',
+    '--force-window=no',
+    '--audio-display=no',
+    '--really-quiet',
+  },
+  keymap = {
+    jump = '<enter>',
+    toggle_pause = '<space>',
+    next = 'n',
+    prev = 'N',
+    volume_up = '+',
+    volume_down = '-',
+  },
+}
+
+local state = {
+  mpv_starting = false,
+  mpv_pid = nil,
+  mpv_waiters = {},
+  queue_meta = {},
+  sock = nil,
+  sock_path = nil,
+  next_request_id = 0,
+  pending_requests = {},
+  player_event_cb = nil,
+  player_observing = false,
+  runtime_setup = false,
+  setup_called = false,
+  reload_pending = false,
+  enter_hook_registered = false,
+}
+
+local socket_send
+local MPV_SOCKET_NOT_READY = 'mpv socket not ready yet'
+
+local function dim(s) return lc.style.span(tostring(s or '')):fg 'blue' end
+local function warm(s) return lc.style.span(tostring(s or '')):fg 'yellow' end
+local function okc(s) return lc.style.span(tostring(s or '')):fg 'green' end
+local function titlec(s) return lc.style.span(tostring(s or '')):fg 'white' end
+
+local function current_cfg() return cfg end
+local function resolved_true() return true end
+
+local function set_mpv_pid(pid, reason, detail)
+  local prev = state.mpv_pid
+  state.mpv_pid = pid
+
+  if prev == pid then return end
+
+  lc.log(
+    'info',
+    'mpv_pid {} -> {}: {}{}',
+    tostring(prev),
+    tostring(pid),
+    tostring(reason or 'unknown'),
+    detail and ('; ' .. tostring(detail)) or ''
+  )
+end
+
+local function current_path_is_mpv()
+  local path = lc.api.get_current_path() or {}
+  return path[1] == 'mpv'
+end
+
+local function notify_error(err)
+  lc.notify(lc.style.line {
+    lc.style.span('mpv: '):fg 'red',
+    lc.style.span(tostring(err)):fg 'red',
+  })
+end
+
+local function schedule_reload()
+  if state.reload_pending then return end
+  state.reload_pending = true
+  lc.defer_fn(function()
+    state.reload_pending = false
+    if current_path_is_mpv() then lc.cmd 'reload' end
+  end, 50)
+end
+
+local function register_enter_hook()
+  if state.enter_hook_registered then return end
+  state.enter_hook_registered = true
+
+  lc.hook.post_page_enter(function(ctx)
+    local path = (ctx and ctx.path) or {}
+    if path[1] == 'mpv' and #path == 1 then lc.cmd 'reload' end
+  end)
+end
+
+local function setup_runtime()
+  if state.runtime_setup then return end
+  state.runtime_setup = true
+  register_enter_hook()
+
+  M.on_player_event(function(event)
+    if not event then return end
+
+    if event.event == 'shutdown' then
+      schedule_reload()
+      return
+    end
+
+    if event.event ~= 'property-change' then return end
+    local name = tostring(event.name or '')
+    if name == 'pause' or name == 'playlist' or name == 'playlist-pos' or name == 'idle-active' or name == 'volume' then
+      schedule_reload()
+    end
+  end)
+
+  lc.hook.pre_quit(function()
+    local ok, err = M.quit_sync()
+    if not ok and err then lc.log('warn', 'failed to quit mpv: {}', err) end
+  end)
+end
+
+local function ensure_setup_called()
+  if state.setup_called then return end
+  error("mpv.setup() must be called before using the mpv module")
+end
+
+local function ensure_ready()
+  ensure_setup_called()
+end
+
+local function socket_exists() return lc.fs.stat(current_cfg().socket).exists end
+
+local function finish_waiters(ok, err)
+  local waiters = state.mpv_waiters
+  state.mpv_waiters = {}
+  state.mpv_starting = false
+  if not ok then set_mpv_pid(nil, 'finish_waiters failed', err) end
+  for _, waiter in ipairs(waiters) do
+    if ok then
+      waiter.resolve(true)
+    else
+      waiter.reject(err)
+    end
+  end
+end
+
+local function wrap_once(cb)
+  local done = false
+  return function(...)
+    if done then return end
+    done = true
+    cb(...)
+  end
+end
+
+local function fail_pending_requests(err)
+  local pending = state.pending_requests
+  state.pending_requests = {}
+  for _, cb in pairs(pending) do
+    cb(nil, err or 'mpv socket closed')
+  end
+end
+
+local function close_socket(err)
+  local sock = state.sock
+  state.sock = nil
+  state.sock_path = nil
+  state.player_observing = false
+  if sock then pcall(function() sock:close() end) end
+  fail_pending_requests(err)
+end
+
+local function response_or_error(response)
+  if response.error and response.error ~= 'success' then
+    return promise.reject(response.error)
+  end
+
+  return response
+end
+
+local function with_notify_reload(p)
+  return p:next(function()
+    lc.cmd 'reload'
+  end):catch(function(err)
+    notify_error(err)
+  end)
+end
+
+local function hydrate_playlist_meta(playlist)
+  for _, item in ipairs(playlist or {}) do
+    local meta = state.queue_meta[item.filename or '']
+    if meta then item._meta = meta end
+  end
+  return playlist
+end
+
+local function build_player_state(playlist_resp, pause_resp)
+  local playlist = hydrate_playlist_meta(playlist_resp.data or {})
+  return {
+    running = true,
+    pause = pause_resp.data == true,
+    playlist = playlist,
+  }
+end
+
+local function emit_player_event(event)
+  if state.player_event_cb then state.player_event_cb(event) end
+end
+
+local function handle_socket_line(line)
+  local ok, decoded = pcall(lc.json.decode, line or '')
+  if not ok or type(decoded) ~= 'table' then return end
+
+  if decoded.event then
+    if decoded.event == 'property-change' then emit_player_event(decoded) end
+    if decoded.event == 'shutdown' then
+      set_mpv_pid(nil, 'mpv shutdown event')
+      emit_player_event(decoded)
+      close_socket 'mpv socket closed'
+    end
+    return
+  end
+
+  local request_id = decoded.request_id
+  if request_id == nil then return end
+
+  local cb = state.pending_requests[request_id]
+  state.pending_requests[request_id] = nil
+  if cb then cb(decoded) end
+end
+
+local function ensure_socket()
+  local current = current_cfg()
+  if state.sock and state.sock_path == current.socket then return state.sock end
+
+  if state.sock then close_socket 'mpv socket reset' end
+
+  local sock = lc.socket.connect('unix:' .. current.socket)
+  sock:on_line(function(line) handle_socket_line(line) end)
+  state.sock = sock
+  state.sock_path = current.socket
+  return sock
+end
+
+local function ensure_player_observers()
+  if state.player_observing then return end
+  state.player_observing = true
+
+  socket_send { command = { 'observe_property', 1, 'pause' } }
+  socket_send { command = { 'observe_property', 2, 'playlist' } }
+  socket_send { command = { 'observe_property', 3, 'playlist-pos' } }
+  socket_send { command = { 'observe_property', 4, 'idle-active' } }
+  socket_send { command = { 'observe_property', 5, 'volume' } }
+end
+
+socket_send = function(payload, cb)
+  if not socket_exists() then
+    if cb then cb(nil, 'mpv not running') end
+    return
+  end
+
+  local sock
+  local ok, result = pcall(ensure_socket)
+  if ok then
+    sock = result
+  else
+    close_socket(result)
+    if cb then cb(nil, tostring(result)) end
+    return
+  end
+
+  if cb then cb = wrap_once(cb) end
+
+  local request_id = state.next_request_id + 1
+  state.next_request_id = request_id
+  payload.request_id = request_id
+
+  if cb then state.pending_requests[request_id] = cb end
+
+  local write_ok, write_err = pcall(function() sock:write(lc.json.encode(payload)) end)
+  if write_ok then return end
+
+  state.pending_requests[request_id] = nil
+  close_socket(write_err)
+  if cb then cb(nil, tostring(write_err)) end
+end
+
+local function socket_send_p(payload)
+  return promise.new(function(resolve, reject)
+    socket_send(payload, function(response, err)
+      if err or not response then
+        reject(err)
+        return
+      end
+      resolve(response)
+    end)
+  end)
+end
+
+local function mpv_request_no_spawn_p(command)
+  if not socket_exists() then
+    if state.mpv_starting then
+      lc.log(
+        'info',
+        'mpv socket not ready yet while starting: {}; pid={}',
+        table.concat(command or {}, ' '),
+        tostring(state.mpv_pid)
+      )
+      return promise.reject(MPV_SOCKET_NOT_READY)
+    else
+      set_mpv_pid(nil, 'socket missing before request', table.concat(command or {}, ' '))
+      close_socket 'mpv not running'
+      return promise.reject 'mpv not running'
+    end
+    close_socket 'mpv not running'
+  end
+
+  ensure_player_observers()
+
+  return socket_send_p({ command = command }):next(response_or_error)
+end
+
+function M.on_player_event(cb) state.player_event_cb = cb end
+
+local function probe_mpv_p()
+  return mpv_request_no_spawn_p({ 'get_property', 'pause' })
+    :next(resolved_true)
+    :catch(function(err)
+      if err == MPV_SOCKET_NOT_READY and state.mpv_starting then
+        return promise.reject(err)
+      end
+
+      local current = current_cfg()
+      set_mpv_pid(nil, 'probe_mpv failed', err)
+      close_socket(err)
+      if socket_exists() then lc.fs.remove(current.socket) end
+      return promise.reject(err)
+    end)
+end
+
+local function wait_for_socket(attempt)
+  if attempt > 40 then
+    finish_waiters(nil, 'mpv socket did not become ready')
+    return
+  end
+
+  probe_mpv_p():next(function()
+    if state.mpv_starting then
+      finish_waiters(true)
+    end
+  end, function()
+    lc.defer_fn(function() wait_for_socket(attempt + 1) end, 100)
+  end)
+end
+
+local function ensure_mpv_p()
+  ensure_ready()
+
+  if not lc.system.executable 'mpv' then
+    return promise.reject 'mpv not found in PATH'
+  end
+
+  return probe_mpv_p():catch(function(err)
+    local waiter_p = promise.new(function(resolve, reject)
+      table.insert(state.mpv_waiters, { resolve = resolve, reject = reject })
+      if state.mpv_starting then return end
+
+      state.mpv_starting = true
+      local current = current_cfg()
+      close_socket 'mpv restarting'
+      if socket_exists() then lc.fs.remove(current.socket) end
+
+      local cmd = { 'mpv' }
+      for _, arg in ipairs(current.mpv_args or {}) do
+        table.insert(cmd, arg)
+      end
+      table.insert(cmd, '--input-ipc-server=' .. current.socket)
+      local pid = lc.system.spawn(cmd)
+      set_mpv_pid(pid ~= 0 and pid or nil, 'spawned mpv', table.concat(cmd, ' '))
+      wait_for_socket(1)
+    end)
+
+    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then
+      return waiter_p
+    end
+
+    return waiter_p
+  end)
+end
+
+local function mpv_request_p(command)
+  return ensure_mpv_p():next(function()
+    return mpv_request_no_spawn_p(command)
+  end)
+end
+
+local function normalize_track(track)
+  if type(track) ~= 'table' then return nil, 'track must be a table' end
+
+  local url = track.url or track.filename
+  if type(url) ~= 'string' or url == '' then return nil, 'track.url is required' end
+
+  return {
+    key = track.key or track.id or url,
+    id = track.id,
+    url = url,
+    title = track.title or track.name,
+    display = track.display,
+    preview = track.preview,
+    keymap = track.keymap,
+  }
+end
+
+local function load_tracks_step(normalized, replace, index)
+  if index > #normalized then
+    return mpv_request_no_spawn_p({ 'set_property', 'pause', false }):next(resolved_true)
+  end
+
+  local track = normalized[index]
+  state.queue_meta[track.url] = track
+  local mode = (replace and index == 1) and 'replace' or 'append-play'
+
+  return mpv_request_no_spawn_p({ 'loadfile', track.url, mode }):next(function()
+    return load_tracks_step(normalized, replace, index + 1)
+  end)
+end
+
+local function queue_tracks_p(tracks, replace)
+  if not tracks or #tracks == 0 then
+    return promise.resolve(true)
+  end
+
+  local normalized = {}
+  for _, track in ipairs(tracks) do
+    local item, err = normalize_track(track)
+    if not item then return promise.reject(err) end
+    table.insert(normalized, item)
+  end
+
+  return ensure_mpv_p():next(function()
+    return load_tracks_step(normalized, replace, 1)
+  end)
+end
+
+local function default_track_display(item, player, meta)
+  local current = item.current or item.playing
+  local marker = dim '  '
+  if current then marker = (player.pause == true) and warm '⏸ ' or okc '▶ ' end
+
+  return lc.style.line {
+    marker,
+    titlec(item.title or item.filename or meta.url or ('#' .. tostring(item.id or '?'))),
+  }
+end
+
+local function jump_to_entry()
+  local target = lc.api.page_get_hovered()
+  if not target or target.playlist_index == nil then return false end
+
+  with_notify_reload(M.player_jump(target.playlist_index))
+
+  return true
+end
+
+local function toggle_pause()
+  with_notify_reload(M.player_toggle_pause())
+
+  return true
+end
+
+local function play_next()
+  with_notify_reload(M.player_next())
+
+  return true
+end
+
+local function play_prev()
+  with_notify_reload(M.player_prev())
+
+  return true
+end
+
+local function adjust_volume(delta)
+  M.player_adjust_volume(delta)
+    :next(function(volume)
+      if type(volume) == 'number' then
+        lc.notify(lc.style.line {
+          lc.style.span('mpv: '):fg 'cyan',
+          lc.style.span(string.format('Volume %.0f%%', volume)):fg 'white',
+        })
+      end
+    end)
+    :catch(function(err)
+      notify_error(err)
+    end)
+
+  return true
+end
+
+local function base_track_keymap()
+  local keymap = current_cfg().keymap or {}
+  return {
+    [keymap.jump or keymap.play_now] = { callback = jump_to_entry, desc = 'jump to this song' },
+    [keymap.toggle_pause] = { callback = toggle_pause, desc = 'pause or resume player' },
+    [keymap.next] = { callback = play_next, desc = 'next song' },
+    [keymap.prev] = { callback = play_prev, desc = 'previous song' },
+    [keymap.volume_up] = { callback = function() return adjust_volume(5) end, desc = 'volume up' },
+    [keymap.volume_down] = { callback = function() return adjust_volume(-5) end, desc = 'volume down' },
+  }
+end
+
+local function control_only_keymap()
+  local keymap = base_track_keymap()
+  keymap[current_cfg().keymap.jump or current_cfg().keymap.play_now] = nil
+  return keymap
+end
+
+local function merge_keymap(extra)
+  local merged = base_track_keymap()
+  for key, value in pairs(extra or {}) do
+    merged[key] = value
+  end
+  return merged
+end
+
+function M.setup(opt)
+  cfg = lc.tbl_deep_extend('force', cfg, opt or {})
+  state.setup_called = true
+  setup_runtime()
+end
+
+function M.play_tracks(tracks)
+  ensure_ready()
+  return queue_tracks_p(tracks, true)
+end
+
+function M.append_tracks(tracks)
+  ensure_ready()
+  return queue_tracks_p(tracks, false)
+end
+
+function M.update_track_fields(id, fields)
+  ensure_ready()
+  for _, meta in pairs(state.queue_meta) do
+    if tostring(meta.id) == tostring(id) then
+      for key, value in pairs(fields or {}) do
+        meta[key] = value
+      end
+    end
+  end
+end
+
+function M.player_next()
+  ensure_ready()
+  return mpv_request_p({ 'playlist-next', 'force' })
+end
+
+function M.player_prev()
+  ensure_ready()
+  return mpv_request_p({ 'playlist-prev', 'force' })
+end
+
+function M.player_toggle_pause()
+  ensure_ready()
+  return mpv_request_p({ 'cycle', 'pause' })
+end
+
+function M.player_play()
+  ensure_ready()
+  return mpv_request_p({ 'set_property', 'pause', false })
+end
+
+function M.player_adjust_volume(delta)
+  ensure_ready()
+  return mpv_request_p({ 'add', 'volume', delta }):next(function()
+    return mpv_request_no_spawn_p({ 'get_property', 'volume' })
+      :next(function(response) return response and response.data or true end)
+      :catch(function() return true end)
+  end)
+end
+
+function M.player_jump(index)
+  ensure_ready()
+  return mpv_request_p({ 'set_property', 'playlist-pos', index }):next(function()
+    return M.player_play()
+  end)
+end
+
+function M.quit_sync()
+  lc.log('info', 'quitting mpv: {}', tostring(state.mpv_pid))
+  if not state.mpv_pid then return true end
+  local ok, err = pcall(lc.system.kill, state.mpv_pid)
+  if not ok then return nil, tostring(err) end
+
+  set_mpv_pid(nil, 'quit_sync killed process')
+  close_socket 'mpv socket closed'
+  return true
+end
+
+local function get_player_state_p()
+  ensure_ready()
+
+  return probe_mpv_p()
+    :next(function()
+      return mpv_request_no_spawn_p({ 'get_property', 'playlist' }):next(function(playlist_resp)
+        return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(function(pause_resp)
+          return build_player_state(playlist_resp, pause_resp)
+        end)
+      end)
+    end)
+    :catch(function()
+      return {
+        running = false,
+        pause = true,
+        playlist = {},
+      }
+    end)
+end
+
+function M.get_player_state()
+  return get_player_state_p()
+end
+
+function M.list(path, cb)
+  ensure_ready()
+
+  if #path > 1 then
+    cb {}
+    return
+  end
+
+  M.get_player_state()
+    :next(function(player)
+      local entries = {}
+      for index, item in ipairs(player.playlist or {}) do
+        local meta = item._meta or {}
+        item._player = player
+
+        local entry = {
+          key = tostring(meta.key or index - 1),
+          player = player,
+          player_item = item,
+          mpv_meta = meta,
+          playlist_index = index - 1,
+          display = type(meta.display) == 'function' and meta.display(item, player, meta)
+            or meta.display
+            or default_track_display(item, player, meta),
+          keymap = merge_keymap(meta.keymap),
+        }
+
+        if type(meta.preview) == 'function' then
+          entry.preview = function(self, preview_cb)
+            local preview = meta.preview(self, preview_cb)
+            if preview then preview_cb(preview) end
+          end
+        end
+
+        table.insert(entries, entry)
+      end
+
+      if #entries == 0 then
+        entries = {
+          {
+            key = 'empty',
+            kind = 'info',
+            keymap = control_only_keymap(),
+            player = player,
+            mpv_meta = {},
+            display = lc.style.line {
+              dim(player.running and 'mpv queue is empty' or 'mpv is not running'),
+            },
+          },
+        }
+      end
+
+      cb(entries)
+    end)
+    :catch(function(err)
+      cb(nil, err)
+    end)
+end
+
+function M.preview(entry, cb) cb '' end
+
+return M
