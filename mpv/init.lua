@@ -123,12 +123,10 @@ end
 
 local function ensure_setup_called()
   if state.setup_called then return end
-  error("mpv.setup() must be called before using the mpv module")
+  error 'mpv.setup() must be called before using the mpv module'
 end
 
-local function ensure_ready()
-  ensure_setup_called()
-end
+local function ensure_ready() ensure_setup_called() end
 
 local function socket_exists() return lc.fs.stat(current_cfg().socket).exists end
 
@@ -173,19 +171,13 @@ local function close_socket(err)
 end
 
 local function response_or_error(response)
-  if response.error and response.error ~= 'success' then
-    return promise.reject(response.error)
-  end
+  if response.error and response.error ~= 'success' then return promise.reject(response.error) end
 
   return response
 end
 
 local function with_notify_reload(p)
-  return p:next(function()
-    lc.cmd 'reload'
-  end):catch(function(err)
-    notify_error(err)
-  end)
+  return p:next(function() lc.cmd 'reload' end):catch(function(err) notify_error(err) end)
 end
 
 local function hydrate_playlist_meta(playlist)
@@ -325,19 +317,15 @@ end
 function M.on_player_event(cb) state.player_event_cb = cb end
 
 local function probe_mpv_p()
-  return mpv_request_no_spawn_p({ 'get_property', 'pause' })
-    :next(resolved_true)
-    :catch(function(err)
-      if err == MPV_SOCKET_NOT_READY and state.mpv_starting then
-        return promise.reject(err)
-      end
+  return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(resolved_true):catch(function(err)
+    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then return promise.reject(err) end
 
-      local current = current_cfg()
-      set_mpv_pid(nil, 'probe_mpv failed', err)
-      close_socket(err)
-      if socket_exists() then lc.fs.remove(current.socket) end
-      return promise.reject(err)
-    end)
+    local current = current_cfg()
+    set_mpv_pid(nil, 'probe_mpv failed', err)
+    close_socket(err)
+    if socket_exists() then lc.fs.remove(current.socket) end
+    return promise.reject(err)
+  end)
 end
 
 local function wait_for_socket(attempt)
@@ -347,9 +335,7 @@ local function wait_for_socket(attempt)
   end
 
   probe_mpv_p():next(function()
-    if state.mpv_starting then
-      finish_waiters(true)
-    end
+    if state.mpv_starting then finish_waiters(true) end
   end, function()
     lc.defer_fn(function() wait_for_socket(attempt + 1) end, 100)
   end)
@@ -358,9 +344,7 @@ end
 local function ensure_mpv_p()
   ensure_ready()
 
-  if not lc.system.executable 'mpv' then
-    return promise.reject 'mpv not found in PATH'
-  end
+  if not lc.system.executable 'mpv' then return promise.reject 'mpv not found in PATH' end
 
   return probe_mpv_p():catch(function(err)
     local waiter_p = promise.new(function(resolve, reject)
@@ -382,18 +366,14 @@ local function ensure_mpv_p()
       wait_for_socket(1)
     end)
 
-    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then
-      return waiter_p
-    end
+    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then return waiter_p end
 
     return waiter_p
   end)
 end
 
 local function mpv_request_p(command)
-  return ensure_mpv_p():next(function()
-    return mpv_request_no_spawn_p(command)
-  end)
+  return ensure_mpv_p():next(function() return mpv_request_no_spawn_p(command) end)
 end
 
 local function normalize_track(track)
@@ -414,23 +394,19 @@ local function normalize_track(track)
 end
 
 local function load_tracks_step(normalized, replace, index)
-  if index > #normalized then
-    return mpv_request_no_spawn_p({ 'set_property', 'pause', false }):next(resolved_true)
-  end
+  if index > #normalized then return mpv_request_no_spawn_p({ 'set_property', 'pause', false }):next(resolved_true) end
 
   local track = normalized[index]
   state.queue_meta[track.url] = track
   local mode = (replace and index == 1) and 'replace' or 'append-play'
 
-  return mpv_request_no_spawn_p({ 'loadfile', track.url, mode }):next(function()
-    return load_tracks_step(normalized, replace, index + 1)
-  end)
+  return mpv_request_no_spawn_p({ 'loadfile', track.url, mode }):next(
+    function() return load_tracks_step(normalized, replace, index + 1) end
+  )
 end
 
 local function queue_tracks_p(tracks, replace)
-  if not tracks or #tracks == 0 then
-    return promise.resolve(true)
-  end
+  if not tracks or #tracks == 0 then return promise.resolve(true) end
 
   local normalized = {}
   for _, track in ipairs(tracks) do
@@ -439,9 +415,7 @@ local function queue_tracks_p(tracks, replace)
     table.insert(normalized, item)
   end
 
-  return ensure_mpv_p():next(function()
-    return load_tracks_step(normalized, replace, 1)
-  end)
+  return ensure_mpv_p():next(function() return load_tracks_step(normalized, replace, 1) end)
 end
 
 local function default_track_display(item, player, meta)
@@ -492,9 +466,7 @@ local function adjust_volume(delta)
         })
       end
     end)
-    :catch(function(err)
-      notify_error(err)
-    end)
+    :catch(function(err) notify_error(err) end)
 
   return true
 end
@@ -554,22 +526,22 @@ end
 
 function M.player_next()
   ensure_ready()
-  return mpv_request_p({ 'playlist-next', 'force' })
+  return mpv_request_p { 'playlist-next', 'force' }
 end
 
 function M.player_prev()
   ensure_ready()
-  return mpv_request_p({ 'playlist-prev', 'force' })
+  return mpv_request_p { 'playlist-prev', 'force' }
 end
 
 function M.player_toggle_pause()
   ensure_ready()
-  return mpv_request_p({ 'cycle', 'pause' })
+  return mpv_request_p { 'cycle', 'pause' }
 end
 
 function M.player_play()
   ensure_ready()
-  return mpv_request_p({ 'set_property', 'pause', false })
+  return mpv_request_p { 'set_property', 'pause', false }
 end
 
 function M.player_adjust_volume(delta)
@@ -583,9 +555,7 @@ end
 
 function M.player_jump(index)
   ensure_ready()
-  return mpv_request_p({ 'set_property', 'playlist-pos', index }):next(function()
-    return M.player_play()
-  end)
+  return mpv_request_p({ 'set_property', 'playlist-pos', index }):next(function() return M.player_play() end)
 end
 
 function M.quit_sync()
@@ -605,23 +575,23 @@ local function get_player_state_p()
   return probe_mpv_p()
     :next(function()
       return mpv_request_no_spawn_p({ 'get_property', 'playlist' }):next(function(playlist_resp)
-        return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(function(pause_resp)
-          return build_player_state(playlist_resp, pause_resp)
-        end)
+        return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(
+          function(pause_resp) return build_player_state(playlist_resp, pause_resp) end
+        )
       end)
     end)
-    :catch(function()
-      return {
-        running = false,
-        pause = true,
-        playlist = {},
-      }
-    end)
+    :catch(
+      function()
+        return {
+          running = false,
+          pause = true,
+          playlist = {},
+        }
+      end
+    )
 end
 
-function M.get_player_state()
-  return get_player_state_p()
-end
+function M.get_player_state() return get_player_state_p() end
 
 function M.list(path, cb)
   ensure_ready()
@@ -677,9 +647,7 @@ function M.list(path, cb)
 
       cb(entries)
     end)
-    :catch(function(err)
-      cb(nil, err)
-    end)
+    :catch(function(err) cb(nil, err) end)
 end
 
 function M.preview(entry, cb) cb '' end
