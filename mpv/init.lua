@@ -1,5 +1,4 @@
 local M = {}
-local promise = require 'promise'
 
 local cfg = {
   socket = '/tmp/lazycmd-mpv.sock',
@@ -12,7 +11,7 @@ local cfg = {
   },
   keymap = {
     jump = '<enter>',
-    toggle_pause = '<space>',
+    toggle_pause = 'p',
     next = 'n',
     prev = 'N',
     volume_up = '+',
@@ -110,7 +109,7 @@ local function setup_runtime()
 
     if event.event ~= 'property-change' then return end
     local name = tostring(event.name or '')
-    if name == 'pause' or name == 'playlist' or name == 'playlist-pos' or name == 'idle-active' or name == 'volume' then
+    if name == 'pause' or name == 'playlist' or name == 'playlist-pos' or name == 'idle-active' then
       schedule_reload()
     end
   end)
@@ -171,7 +170,7 @@ local function close_socket(err)
 end
 
 local function response_or_error(response)
-  if response.error and response.error ~= 'success' then return promise.reject(response.error) end
+  if response.error and response.error ~= 'success' then return Promise.reject(response.error) end
 
   return response
 end
@@ -244,7 +243,6 @@ local function ensure_player_observers()
   socket_send { command = { 'observe_property', 2, 'playlist' } }
   socket_send { command = { 'observe_property', 3, 'playlist-pos' } }
   socket_send { command = { 'observe_property', 4, 'idle-active' } }
-  socket_send { command = { 'observe_property', 5, 'volume' } }
 end
 
 socket_send = function(payload, cb)
@@ -280,7 +278,7 @@ socket_send = function(payload, cb)
 end
 
 local function socket_send_p(payload)
-  return promise.new(function(resolve, reject)
+  return Promise.new(function(resolve, reject)
     socket_send(payload, function(response, err)
       if err or not response then
         reject(err)
@@ -300,11 +298,11 @@ local function mpv_request_no_spawn_p(command)
         table.concat(command or {}, ' '),
         tostring(state.mpv_pid)
       )
-      return promise.reject(MPV_SOCKET_NOT_READY)
+      return Promise.reject(MPV_SOCKET_NOT_READY)
     else
       set_mpv_pid(nil, 'socket missing before request', table.concat(command or {}, ' '))
       close_socket 'mpv not running'
-      return promise.reject 'mpv not running'
+      return Promise.reject 'mpv not running'
     end
     close_socket 'mpv not running'
   end
@@ -318,13 +316,13 @@ function M.on_player_event(cb) state.player_event_cb = cb end
 
 local function probe_mpv_p()
   return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(resolved_true):catch(function(err)
-    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then return promise.reject(err) end
+    if err == MPV_SOCKET_NOT_READY and state.mpv_starting then return Promise.reject(err) end
 
     local current = current_cfg()
     set_mpv_pid(nil, 'probe_mpv failed', err)
     close_socket(err)
     if socket_exists() then lc.fs.remove(current.socket) end
-    return promise.reject(err)
+    return Promise.reject(err)
   end)
 end
 
@@ -344,10 +342,10 @@ end
 local function ensure_mpv_p()
   ensure_ready()
 
-  if not lc.system.executable 'mpv' then return promise.reject 'mpv not found in PATH' end
+  if not lc.system.executable 'mpv' then return Promise.reject 'mpv not found in PATH' end
 
   return probe_mpv_p():catch(function(err)
-    local waiter_p = promise.new(function(resolve, reject)
+    local waiter_p = Promise.new(function(resolve, reject)
       table.insert(state.mpv_waiters, { resolve = resolve, reject = reject })
       if state.mpv_starting then return end
 
@@ -406,12 +404,12 @@ local function load_tracks_step(normalized, replace, index)
 end
 
 local function queue_tracks_p(tracks, replace)
-  if not tracks or #tracks == 0 then return promise.resolve(true) end
+  if not tracks or #tracks == 0 then return Promise.resolve(true) end
 
   local normalized = {}
   for _, track in ipairs(tracks) do
     local item, err = normalize_track(track)
-    if not item then return promise.reject(err) end
+    if not item then return Promise.reject(err) end
     table.insert(normalized, item)
   end
 
