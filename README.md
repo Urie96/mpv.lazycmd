@@ -5,8 +5,10 @@
 ## 功能
 
 - `/mpv` 直接显示当前 `mpv` IPC 播放队列
+- 后台 `mpv` 切歌后，如果当前就在 `/mpv`，列表会自动把悬停项移动到正在播放的歌曲
 - 如果 `mpv` 未启动，首次播放时自动拉起后台 `mpv`
 - 支持播放控制：跳转到当前项、暂停/继续、上一首、下一首、恢复播放、调节音量
+- 支持从 `/mpv` 队列删除指定歌曲
 - 其他插件可以调用 `require('mpv').play_tracks()` / `append_tracks()` 往队列里塞歌
 - 其他插件在加歌时可以为每个条目传入自己的 `keymap` 和 `preview`
 - 公开异步 API 统一返回 promise
@@ -32,6 +34,7 @@
         pause = '<space>',
         next = 'n',
         prev = 'p',
+        delete = 'dd',
         volume_up = '+',
         volume_down = '-',
       },
@@ -72,6 +75,11 @@
 
 返回一个 promise。
 
+### `mpv.player_remove(index)`
+
+按 `mpv` 播放列表下标删除指定条目。
+返回一个 promise。
+
 ## Track 结构
 
 `play_tracks()` 和 `append_tracks()` 接收的每个 track 至少需要 `url`：
@@ -104,5 +112,6 @@
 - `pause`: 暂停/继续
 - `next`: 下一首
 - `prev`: 上一首
+- `delete`: 从队列删除当前项
 - `volume_up`: 增大音量
 - `volume_down`: 减小音量

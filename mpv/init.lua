@@ -14,6 +14,7 @@ local cfg = {
     toggle_pause = 'p',
     next = 'n',
     prev = 'N',
+    delete = 'dd',
     volume_up = '+',
     volume_down = '-',
   },
@@ -33,7 +34,7 @@ local state = {
   runtime_setup = false,
   setup_called = false,
   reload_pending = false,
-  enter_hook_registered = false,
+  follow_current_on_reload = false,
 }
 
 local socket_send
@@ -84,20 +85,35 @@ local function schedule_reload()
   end, 50)
 end
 
-local function register_enter_hook()
-  if state.enter_hook_registered then return end
-  state.enter_hook_registered = true
+local function request_follow_current_on_reload()
+  if current_path_is_mpv() then state.follow_current_on_reload = true end
+end
 
-  lc.hook.post_page_enter(function(ctx)
-    local path = (ctx and ctx.path) or {}
-    if path[1] == 'mpv' and #path == 1 then lc.cmd 'reload' end
-  end)
+local function sync_hover_to_current_entry(entries)
+  if not state.follow_current_on_reload then return end
+  state.follow_current_on_reload = false
+
+  if not current_path_is_mpv() then return end
+
+  local current_key = nil
+  for _, entry in ipairs(entries or {}) do
+    local item = entry.player_item or {}
+    if item.current == true or item.playing == true then
+      current_key = entry.key
+      break
+    end
+  end
+
+  if current_key == nil then return end
+
+  lc.defer_fn(function()
+    if current_path_is_mpv() then lc.api.page_set_hovered { 'mpv', tostring(current_key) } end
+  end, 0)
 end
 
 local function setup_runtime()
   if state.runtime_setup then return end
   state.runtime_setup = true
-  register_enter_hook()
 
   M.on_player_event(function(event)
     if not event then return end
@@ -109,6 +125,7 @@ local function setup_runtime()
 
     if event.event ~= 'property-change' then return end
     local name = tostring(event.name or '')
+    if name == 'playlist-pos' then request_follow_current_on_reload() end
     if name == 'pause' or name == 'playlist' or name == 'playlist-pos' or name == 'idle-active' then
       schedule_reload()
     end
@@ -175,9 +192,7 @@ local function response_or_error(response)
   return response
 end
 
-local function with_notify_reload(p)
-  return p:next(function() lc.cmd 'reload' end):catch(function(err) notify_error(err) end)
-end
+local function with_notify(p) return p:catch(function(err) notify_error(err) end) end
 
 local function hydrate_playlist_meta(playlist)
   for _, item in ipairs(playlist or {}) do
@@ -380,15 +395,17 @@ local function normalize_track(track)
   local url = track.url or track.filename
   if type(url) ~= 'string' or url == '' then return nil, 'track.url is required' end
 
-  return {
-    key = track.key or track.id or url,
-    id = track.id,
-    url = url,
-    title = track.title or track.name,
-    display = track.display,
-    preview = track.preview,
-    keymap = track.keymap,
-  }
+  local normalized = {}
+  for key, value in pairs(track) do
+    normalized[key] = value
+  end
+
+  normalized.key = track.key or track.id or url
+  normalized.id = track.id
+  normalized.url = url
+  normalized.title = track.title or track.name
+
+  return normalized
 end
 
 local function load_tracks_step(normalized, replace, index)
@@ -431,25 +448,34 @@ local function jump_to_entry()
   local target = lc.api.page_get_hovered()
   if not target or target.playlist_index == nil then return false end
 
-  with_notify_reload(M.player_jump(target.playlist_index))
+  with_notify(M.player_jump(target.playlist_index))
 
   return true
 end
 
 local function toggle_pause()
-  with_notify_reload(M.player_toggle_pause())
+  with_notify(M.player_toggle_pause())
 
   return true
 end
 
 local function play_next()
-  with_notify_reload(M.player_next())
+  with_notify(M.player_next())
 
   return true
 end
 
 local function play_prev()
-  with_notify_reload(M.player_prev())
+  with_notify(M.player_prev())
+
+  return true
+end
+
+local function remove_entry()
+  local target = lc.api.page_get_hovered()
+  if not target or target.playlist_index == nil then return false end
+
+  with_notify(M.player_remove(target.playlist_index))
 
   return true
 end
@@ -476,6 +502,7 @@ local function base_track_keymap()
     [keymap.toggle_pause] = { callback = toggle_pause, desc = 'pause or resume player' },
     [keymap.next] = { callback = play_next, desc = 'next song' },
     [keymap.prev] = { callback = play_prev, desc = 'previous song' },
+    [keymap.delete] = { callback = remove_entry, desc = 'remove from queue' },
     [keymap.volume_up] = { callback = function() return adjust_volume(5) end, desc = 'volume up' },
     [keymap.volume_down] = { callback = function() return adjust_volume(-5) end, desc = 'volume down' },
   }
@@ -554,6 +581,11 @@ end
 function M.player_jump(index)
   ensure_ready()
   return mpv_request_p({ 'set_property', 'playlist-pos', index }):next(function() return M.player_play() end)
+end
+
+function M.player_remove(index)
+  ensure_ready()
+  return mpv_request_p { 'playlist-remove', index }
 end
 
 function M.quit_sync()
@@ -644,6 +676,7 @@ function M.list(path, cb)
       end
 
       cb(entries)
+      sync_hover_to_current_entry(entries)
     end)
     :catch(function(err) cb(nil, err) end)
 end
