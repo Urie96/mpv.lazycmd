@@ -10,7 +10,6 @@ local cfg = {
     '--really-quiet',
   },
   keymap = {
-    jump = '<enter>',
     toggle_pause = 'p',
     next = 'n',
     prev = 'N',
@@ -107,7 +106,7 @@ local function sync_hover_to_current_entry(entries)
   if current_key == nil then return end
 
   lc.defer_fn(function()
-    if current_path_is_mpv() then lc.api.page_set_hovered { 'mpv', tostring(current_key) } end
+    if current_path_is_mpv() then lc.api.set_hovered { 'mpv', tostring(current_key) } end
   end, 0)
 end
 
@@ -192,7 +191,9 @@ local function response_or_error(response)
   return response
 end
 
-local function with_notify(p) return p:catch(function(err) notify_error(err) end) end
+local function with_notify(p)
+  return p:catch(function(err) notify_error(err) end)
+end
 
 local function hydrate_playlist_meta(playlist)
   for _, item in ipairs(playlist or {}) do
@@ -445,7 +446,7 @@ local function default_track_display(item, player, meta)
 end
 
 local function jump_to_entry()
-  local target = lc.api.page_get_hovered()
+  local target = lc.api.get_hovered()
   if not target or target.playlist_index == nil then return false end
 
   with_notify(M.player_jump(target.playlist_index))
@@ -472,7 +473,7 @@ local function play_prev()
 end
 
 local function remove_entry()
-  local target = lc.api.page_get_hovered()
+  local target = lc.api.get_hovered()
   if not target or target.playlist_index == nil then return false end
 
   with_notify(M.player_remove(target.playlist_index))
@@ -498,7 +499,7 @@ end
 local function base_track_keymap()
   local keymap = current_cfg().keymap or {}
   return {
-    [keymap.jump or keymap.play_now] = { callback = jump_to_entry, desc = 'jump to this song' },
+    [keymap.enter] = { callback = jump_to_entry, desc = 'jump to this song' },
     [keymap.toggle_pause] = { callback = toggle_pause, desc = 'pause or resume player' },
     [keymap.next] = { callback = play_next, desc = 'next song' },
     [keymap.prev] = { callback = play_prev, desc = 'previous song' },
@@ -510,7 +511,7 @@ end
 
 local function control_only_keymap()
   local keymap = base_track_keymap()
-  keymap[current_cfg().keymap.jump or current_cfg().keymap.play_now] = nil
+  keymap[current_cfg().keymap.enter] = nil
   return keymap
 end
 
@@ -523,7 +524,8 @@ local function merge_keymap(extra)
 end
 
 function M.setup(opt)
-  cfg = lc.tbl_deep_extend('force', cfg, opt or {})
+  local global_keymap = lc.config.get().keymap or {}
+  cfg = lc.tbl_deep_extend('force', cfg, { keymap = global_keymap }, opt or {})
   state.setup_called = true
   setup_runtime()
 end
