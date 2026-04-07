@@ -44,6 +44,17 @@ local function warm(s) return lc.style.span(tostring(s or '')):fg 'yellow' end
 local function okc(s) return lc.style.span(tostring(s or '')):fg 'green' end
 local function titlec(s) return lc.style.span(tostring(s or '')):fg 'white' end
 
+local function volume_bottom_line()
+  local vol = state.volume
+  if type(vol) ~= 'number' then return nil end
+  local color = 'cyan'
+  return lc.style.line {
+    (''):fg(color),
+    string.format('  %.0f%% ', vol):fg('white'):bg(color),
+    (''):fg(color),
+  }
+end
+
 local function current_cfg() return cfg end
 local function resolved_true() return true end
 
@@ -125,6 +136,7 @@ local function setup_runtime()
     if event.event ~= 'property-change' then return end
     local name = tostring(event.name or '')
     if name == 'playlist-pos' then request_follow_current_on_reload() end
+    if name == 'volume' then state.volume = event.data end
     if name == 'pause' or name == 'playlist' or name == 'playlist-pos' or name == 'idle-active' then
       schedule_reload()
     end
@@ -203,8 +215,9 @@ local function hydrate_playlist_meta(playlist)
   return playlist
 end
 
-local function build_player_state(playlist_resp, pause_resp)
+local function build_player_state(playlist_resp, pause_resp, volume_resp)
   local playlist = hydrate_playlist_meta(playlist_resp.data or {})
+  if type((volume_resp or {}).data) == 'number' then state.volume = volume_resp.data end
   return {
     running = true,
     pause = pause_resp.data == true,
@@ -259,6 +272,7 @@ local function ensure_player_observers()
   socket_send { command = { 'observe_property', 2, 'playlist' } }
   socket_send { command = { 'observe_property', 3, 'playlist-pos' } }
   socket_send { command = { 'observe_property', 4, 'idle-active' } }
+  socket_send { command = { 'observe_property', 5, 'volume' } }
 end
 
 socket_send = function(payload, cb)
@@ -607,9 +621,11 @@ local function get_player_state_p()
   return probe_mpv_p()
     :next(function()
       return mpv_request_no_spawn_p({ 'get_property', 'playlist' }):next(function(playlist_resp)
-        return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(
-          function(pause_resp) return build_player_state(playlist_resp, pause_resp) end
-        )
+        return mpv_request_no_spawn_p({ 'get_property', 'pause' }):next(function(pause_resp)
+          return mpv_request_no_spawn_p({ 'get_property', 'volume' }):next(
+            function(volume_resp) return build_player_state(playlist_resp, pause_resp, volume_resp) end
+          )
+        end)
       end)
     end)
     :catch(
@@ -649,6 +665,7 @@ function M.list(path, cb)
           display = type(meta.display) == 'function' and meta.display(item, player, meta)
             or meta.display
             or default_track_display(item, player, meta),
+          bottom_line = volume_bottom_line,
           keymap = merge_keymap(meta.keymap),
         }
 
