@@ -34,6 +34,8 @@ local state = {
   setup_called = false,
   reload_pending = false,
   follow_current_on_reload = false,
+  http_resolver_name = 'mpv-track',
+  next_http_track_id = 0,
 }
 
 local socket_send
@@ -57,6 +59,7 @@ end
 
 local function current_cfg() return cfg end
 local function resolved_true() return true end
+local function current_http_resolver_name() return state.http_resolver_name end
 
 local function set_mpv_pid(pid, reason, detail)
   local prev = state.mpv_pid
@@ -84,6 +87,83 @@ local function notify_error(err)
     lc.style.span('mpv: '):fg 'red',
     lc.style.span(tostring(err)):fg 'red',
   })
+end
+
+local function respond_local_track(request, respond)
+  if tostring(request.method or 'GET'):upper() ~= 'GET' then
+    respond {
+      status = 405,
+      body = 'method not allowed',
+    }
+    return
+  end
+
+  local local_id = tostring((request.params or {}).id or ''):match '^%s*(.-)%s*$'
+  if local_id == '' then
+    respond {
+      status = 400,
+      body = 'missing track id',
+    }
+    return
+  end
+
+  local track = state.queue_meta[local_id]
+  if not track then
+    respond {
+      status = 404,
+      body = 'track not found',
+    }
+    return
+  end
+
+  if type(track.get_play_url) ~= 'function' then
+    respond {
+      status = 500,
+      body = 'track resolver missing',
+    }
+    return
+  end
+
+  track.get_play_url(track, function(url, err)
+    if err then
+      respond {
+        status = 502,
+        body = tostring(err),
+      }
+      return
+    end
+
+    local resolved = tostring(url or ''):match '^%s*(.-)%s*$'
+    if resolved == '' then
+      respond {
+        status = 404,
+        body = 'track url not found',
+      }
+      return
+    end
+
+    track.resolved_url = resolved
+    respond {
+      status = 307,
+      headers = {
+        Location = resolved,
+        ['Cache-Control'] = 'no-store',
+      },
+    }
+  end)
+end
+
+local function ensure_http_resolver_registered()
+  lc.http_server.register_resolver(current_http_resolver_name(), respond_local_track)
+end
+
+local function next_local_track_id()
+  state.next_http_track_id = state.next_http_track_id + 1
+  return tostring(state.next_http_track_id)
+end
+
+local function build_local_track_url(local_id)
+  return lc.http_server.url(current_http_resolver_name(), { id = tostring(local_id) })
 end
 
 local function schedule_reload()
@@ -124,6 +204,7 @@ end
 local function setup_runtime()
   if state.runtime_setup then return end
   state.runtime_setup = true
+  ensure_http_resolver_registered()
 
   M.on_player_event(function(event)
     if not event then return end
@@ -209,7 +290,7 @@ end
 
 local function hydrate_playlist_meta(playlist)
   for _, item in ipairs(playlist or {}) do
-    local meta = state.queue_meta[item.filename or '']
+    local meta = state.queue_meta[item.filename or ''] or state.queue_meta[tostring(item.id or '')]
     if meta then item._meta = meta end
   end
   return playlist
@@ -407,17 +488,25 @@ end
 local function normalize_track(track)
   if type(track) ~= 'table' then return nil, 'track must be a table' end
 
-  local url = track.url or track.filename
-  if type(url) ~= 'string' or url == '' then return nil, 'track.url is required' end
-
   local normalized = {}
   for key, value in pairs(track) do
     normalized[key] = value
   end
 
-  normalized.key = track.key or track.id or url
+  local url = track.url or track.filename
+  if (type(url) ~= 'string' or url == '') and type(track.get_play_url) ~= 'function' then
+    return nil, 'track.url or track.get_play_url is required'
+  end
+
+  if type(track.get_play_url) == 'function' and (type(url) ~= 'string' or url == '') then
+    normalized.local_id = next_local_track_id()
+    normalized.url = build_local_track_url(normalized.local_id)
+  else
+    normalized.url = url
+  end
+
+  normalized.key = track.key or track.id or normalized.url
   normalized.id = track.id
-  normalized.url = url
   normalized.title = track.title or track.name
 
   return normalized
@@ -428,6 +517,7 @@ local function load_tracks_step(normalized, replace, index)
 
   local track = normalized[index]
   state.queue_meta[track.url] = track
+  if track.local_id then state.queue_meta[track.local_id] = track end
   local mode = (replace and index == 1) and 'replace' or 'append-play'
 
   return mpv_request_no_spawn_p({ 'loadfile', track.url, mode }):next(
@@ -540,6 +630,7 @@ end
 function M.setup(opt)
   local global_keymap = lc.config.get().keymap or {}
   cfg = lc.tbl_deep_extend('force', cfg, { keymap = global_keymap }, opt or {})
+  state.http_resolver_name = 'mpv-track-' .. tostring(cfg.socket or '/tmp/lazycmd-mpv.sock'):gsub('[^%w]+', '-')
   state.setup_called = true
   setup_runtime()
 end

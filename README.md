@@ -82,12 +82,20 @@
 
 ## Track 结构
 
-`play_tracks()` 和 `append_tracks()` 接收的每个 track 至少需要 `url`：
+`play_tracks()` 和 `append_tracks()` 接收的每个 track 至少需要 `url` 或 `get_play_url(track, cb)` 二选一：
 
 ```lua
 {
   id = song.id,
   url = stream_url,
+}
+
+-- 或者延迟解析播放链接
+{
+  id = song.id,
+  get_play_url = function(track, cb)
+    cb(stream_url, nil)
+  end,
 
   -- 可选：自定义队列展示
   display = function(item, player, meta) ... end,
@@ -101,6 +109,8 @@
   },
 }
 ```
+
+当 track 提供 `get_play_url` 时，`mpv.lazycmd` 会在插件内部生成一个 localhost 稳定 URL；真正开始请求音频时，再调用 `get_play_url` 拿最新直链并返回重定向。这适合上游播放链接会过期的 provider。
 
 `mpv` 会自动把播放器控制键和你传入的 `keymap` 合并。
 
